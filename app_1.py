@@ -6,7 +6,8 @@ import io
 import time
 import re
 import subprocess
-from contextlib import redirect_stdout
+import requests
+import json
 
 # Configure the page
 st.set_page_config(
@@ -42,14 +43,6 @@ st.markdown("""
         background-color: #007bff;
         color: white;
     }
-    .upload-container {
-        border: 2px dashed #007bff;
-        border-radius: 10px;
-        padding: 2rem;
-        text-align: center;
-        background-color: #f8f9ff;
-        margin: 1rem 0;
-    }
     .question-container, .code-container, .output-container {
         background-color: #f8f9fa;
         padding: 1.5rem;
@@ -57,13 +50,13 @@ st.markdown("""
         border-left: 4px solid #007bff;
         margin: 1rem 0;
     }
-    .code-editor-container {
-        background-color: #1e1e1e;
-        color: #d4d4d4;
+    .debugger-container {
+        background-color: #fff3cd;
+        border: 1px solid #ffeeba;
         padding: 1.5rem;
         border-radius: 10px;
+        border-left: 4px solid #ffc107;
         margin: 1rem 0;
-        font-family: 'Courier New', Courier, monospace;
     }
     .step-header {
         background: linear-gradient(90deg, #007bff, #0056b3);
@@ -91,75 +84,58 @@ st.markdown("""
         border: 1px solid #f5c6cb;
         margin: 1rem 0;
     }
-    .test-case-pass {
-        color: #28a745;
-        font-weight: bold;
-    }
-    .test-case-fail {
-        color: #dc3545;
-        font-weight: bold;
-    }
-    .regeneration-section {
-        background-color: #fff3cd;
-        border: 1px solid #ffeaa7;
-        border-radius: 10px;
-        padding: 1.5rem;
-        margin: 1rem 0;
-    }
-    .code-history-item {
-        background-color: #f1f3f4;
-        border-left: 3px solid #007bff;
+    .test-case-pass { color: #28a745; font-weight: bold; }
+    .test-case-fail { color: #dc3545; font-weight: bold; }
+    .test-case-error { color: #ffc107; font-weight: bold; }
+    .test-case-container {
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
+        border-radius: 8px;
         padding: 1rem;
         margin: 0.5rem 0;
-        border-radius: 5px;
-    }
-    @media (max-width: 768px) {
-        .main { padding: 1rem; }
-        .stTabs [data-baseweb="tab"] { padding-left: 10px; padding-right: 10px; font-size: 0.9rem; }
-        .upload-container { padding: 1rem; }
     }
 </style>
 """, unsafe_allow_html=True)
 
 # Initialize session state
-if 'api_key' not in st.session_state:
-    st.session_state.api_key = ""
-if 'uploaded_images' not in st.session_state:
-    st.session_state.uploaded_images = []
-if 'extracted_text' not in st.session_state:
-    st.session_state.extracted_text = ""
-if 'formatted_question' not in st.session_state:
-    st.session_state.formatted_question = ""
-if 'generated_code' not in st.session_state:
-    st.session_state.generated_code = ""
-if 'edited_code' not in st.session_state:
-    st.session_state.edited_code = ""
-if 'test_cases' not in st.session_state:
-    st.session_state.test_cases = []
-if 'run_output' not in st.session_state:
-    st.session_state.run_output = ""
-if 'code_history' not in st.session_state:
-    st.session_state.code_history = []
-if 'generation_count' not in st.session_state:
-    st.session_state.generation_count = 0
-if 'user_feedback' not in st.session_state:
-    st.session_state.user_feedback = ""
+st.session_state.setdefault('together_api_key', "")
+st.session_state.setdefault('gemini_api_key', "")
+st.session_state.setdefault('uploaded_images', [])
+st.session_state.setdefault('extracted_text', "")
+st.session_state.setdefault('formatted_question', "")
+st.session_state.setdefault('edited_question', "")
+st.session_state.setdefault('generated_code', "")
+st.session_state.setdefault('edited_code', "")
+st.session_state.setdefault('test_cases', [])
+st.session_state.setdefault('custom_test_cases', [])
+st.session_state.setdefault('run_output', [])
+st.session_state.setdefault('error_feedback', "")
+
 
 # --- API and Helper Functions ---
 
-def handle_api_error(e):
-    st.error(f"An API error occurred: {str(e)}")
+def handle_together_api_error(e):
+    st.error(f"An API error occurred with Together AI: {str(e)}")
     if "authentication" in str(e).lower():
         st.warning("Please check if your Together AI API key is correct and has sufficient credits.")
 
+def handle_gemini_api_error(response):
+    """Handles errors from the Gemini API."""
+    try:
+        error_info = response.json()
+        st.error(f"An API error occurred with Gemini: {error_info.get('error', {}).get('message', 'Unknown error')}")
+    except json.JSONDecodeError:
+        st.error(f"An API error occurred with Gemini. Status code: {response.status_code}, Response: {response.text}")
+
+
 def extract_text_from_images(images, api_key):
-    """Extracts text from a list of images using Llama-Vision."""
+    """Extracts text from images using Together AI's Llama-Vision."""
     if not api_key:
         st.error("Please enter your Together AI API key in the sidebar.")
         return ""
     try:
         client = Together(api_key=api_key)
-        prompt = "Extract all text from the image. Ignore UI elements like buttons or unrelated text."
+        prompt = "Extract all text from the image. Focus on the question, description, examples, and constraints. Ignore UI elements like buttons or unrelated text."
         all_text = []
         for i, image in enumerate(images):
             with st.spinner(f"Analyzing image {i+1}/{len(images)}..."):
@@ -180,11 +156,12 @@ def extract_text_from_images(images, api_key):
                 all_text.append(response.choices[0].message.content)
         return "\n\n---\n\n".join(all_text)
     except Exception as e:
-        handle_api_error(e)
+        handle_together_api_error(e)
         return ""
 
+
 def format_question_with_llama(raw_text, api_key):
-    """Formats the raw text into a structured question using Llama 3.3."""
+    """Formats raw text into a structured question using Together AI."""
     if not api_key:
         st.error("Please enter your Together AI API key in the sidebar.")
         return ""
@@ -192,14 +169,11 @@ def format_question_with_llama(raw_text, api_key):
         client = Together(api_key=api_key)
         prompt = f"""
             Based on the following text extracted from one or more images, please structure it into a clear and well-formatted coding problem.
-            
             The output should strictly follow this format:
             ### Problem Description
-            [Write the question relevant text as it is here. Do not change the wording also.]
-
+            [Provide a clear and concise description of the problem.]
             ### Tasks
             [List the specific tasks or requirements.]
-
             ### Examples
             [Provide at least one example with clear Input and Output.]
             Example 1:
@@ -207,14 +181,9 @@ def format_question_with_llama(raw_text, api_key):
             [Sample Input]
             Output:
             [Sample Output]
-
             ### Explanation (Optional)
             [If provided in the source, add any explanation for the examples.]
-
-            Here is the raw text:
-            ---
-            {raw_text}
-            ---
+            Here is the raw text: --- {raw_text} ---
         """
         response = client.chat.completions.create(
             model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
@@ -223,150 +192,149 @@ def format_question_with_llama(raw_text, api_key):
         )
         return response.choices[0].message.content
     except Exception as e:
-        handle_api_error(e)
+        handle_together_api_error(e)
         return ""
 
-def generate_solution(question, api_key, previous_attempts=None, error_feedback=None, user_comments=None):
-    """Generates a code solution for the given question, optionally considering previous attempts."""
-    if not api_key:
-        st.error("Please enter your Together AI API key in the sidebar.")
+
+def generate_solution_with_gemini(question, gemini_api_key, previous_code=None, error_message=None, user_feedback=None):
+    """Generates or regenerates a code solution using the Gemini API."""
+    if not gemini_api_key:
+        st.error("Please enter your Gemini API key in the sidebar.")
         return ""
-    try:
-        client = Together(api_key=api_key)
-        
-        # Base prompt
+
+    model_name = "gemini-2.5-flash-preview-05-20"
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_api_key}"
+
+    # Base prompt for initial generation
+    prompt = f"""
+        Please provide a complete and runnable Python code solution for the following programming problem.
+        The code should be self-contained and ready to execute.
+        Do not include any explanations, analysis, or markdown formatting, only the raw Python code.
+        Problem: {question}
+    """
+
+    # Modify prompt for debugging and regeneration
+    if previous_code and error_message:
         prompt = f"""
-            Please provide a complete and runnable Python code solution for the following programming problem.
-            The code should be self-contained and ready to execute.
-            Do not include any explanations, analysis, or markdown formatting, only the raw Python code.
+            You are an expert Python programmer debugging a solution.
+            The previous code attempt failed. Please analyze the problem, the faulty code, the error, and the user's feedback to provide a corrected, runnable Python solution.
+            Only output the raw, corrected Python code.
 
-            Problem:
+            **Original Problem:**
             {question}
+
+            **Faulty Code:**
+            ```python
+            {previous_code}
+            ```
+
+            **Error Message:**
+            {error_message}
+
+            **User Feedback (optional):**
+            {user_feedback if user_feedback else "No feedback provided."}
         """
-        
-        # Add context from previous attempts if available
-        if previous_attempts and error_feedback:
-            prompt += f"""
-            
-            IMPORTANT: Previous attempts have failed. Please learn from these mistakes:
-            
-            Previous failed attempts:
-            {previous_attempts}
-            
-            Error feedback from test runs:
-            {error_feedback}
-            """
-            
-            if user_comments:
-                prompt += f"""
-                
-                Additional user feedback:
-                {user_comments}
-                """
-                
-            prompt += """
-            
-            Please generate a NEW and IMPROVED solution that addresses these issues. 
-            Make sure to:
-            1. Fix any logical errors from previous attempts
-            2. Handle edge cases properly
-            3. Follow the exact input/output format specified in the examples
-            4. Test your logic mentally before providing the solution
-            """
-        
-        response = client.chat.completions.create(
-            model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,  # Slightly higher for regeneration to get different approaches
-        )
-        
-        # Extract only the code block
-        code = response.choices[0].message.content
-        code_match = re.search(r'```python\n(.*?)```', code, re.DOTALL)
-        if code_match:
-            return code_match.group(1).strip()
-        return code.strip() # Fallback if no markdown block is found
-    except Exception as e:
-        handle_api_error(e)
+
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    headers = {'Content-Type': 'application/json'}
+
+    try:
+        response = requests.post(api_url, headers=headers, json=payload)
+        if response.status_code == 200:
+            data = response.json()
+            code = data['candidates'][0]['content']['parts'][0]['text']
+            code_match = re.search(r'```python\n(.*?)```', code, re.DOTALL)
+            if code_match:
+                return code_match.group(1).strip()
+            return code.strip()
+        else:
+            handle_gemini_api_error(response)
+            return ""
+    except requests.exceptions.RequestException as e:
+        st.error(f"Network error when calling Gemini API: {e}")
         return ""
+
 
 def extract_test_cases(formatted_question):
     """Extracts input/output pairs from the formatted question using regex."""
     test_cases = []
-    # Regex to find examples, then extract Input and Output blocks
     example_blocks = re.findall(r'Example \d+:(.*?)($|Example \d+:|###)', formatted_question, re.DOTALL)
-    
     for block, _ in example_blocks:
         input_match = re.search(r'Input:\s*\n(.*?)\n\s*Output:', block, re.DOTALL)
         output_match = re.search(r'Output:\s*\n(.*)', block, re.DOTALL)
-        
         if input_match and output_match:
             test_cases.append({
                 "input": input_match.group(1).strip(),
-                "expected_output": output_match.group(1).strip()
+                "expected_output": output_match.group(1).strip(),
+                "type": "extracted"
             })
     return test_cases
 
+
+def add_custom_test_case():
+    """Add a new custom test case to the session state."""
+    if 'custom_test_cases' not in st.session_state:
+        st.session_state.custom_test_cases = []
+    st.session_state.custom_test_cases.append({
+        "input": "",
+        "expected_output": "",
+        "type": "custom"
+    })
+
+
+def remove_custom_test_case(index):
+    """Remove a custom test case at the given index."""
+    if 0 <= index < len(st.session_state.custom_test_cases):
+        st.session_state.custom_test_cases.pop(index)
+
+
+def get_all_test_cases():
+    """Get all test cases (extracted + custom)."""
+    all_cases = st.session_state.test_cases.copy()
+    all_cases.extend(st.session_state.custom_test_cases)
+    return all_cases
+
+
 def run_code(code_string, test_cases):
-    """Executes the given code against a list of test cases and captures the output."""
+    """Executes code against test cases and captures output/errors."""
     results = []
     for i, case in enumerate(test_cases):
         try:
-            # Execute the code as a subprocess for safety
             process = subprocess.run(
                 ['python', '-c', code_string],
-                input=case['input'],
-                text=True,
-                capture_output=True,
-                timeout=10  # 10-second timeout to prevent infinite loops
+                input=case['input'], text=True, capture_output=True, timeout=10
             )
-            
-            stdout = process.stdout.strip()
-            stderr = process.stderr.strip()
-            
-            result = {"case": i + 1, "input": case['input']}
+            stdout, stderr = process.stdout.strip(), process.stderr.strip()
+            result = {
+                "case": i + 1, 
+                "input": case['input'],
+                "type": case.get('type', 'extracted')
+            }
             if stderr:
-                result["status"] = "Error"
-                result["output"] = stderr
+                result.update({"status": "Error", "output": stderr})
             else:
-                result["output"] = stdout
-                if stdout == case['expected_output']:
-                    result["status"] = "Passed"
-                else:
-                    result["status"] = "Failed"
+                result.update({"output": stdout})
+                result["status"] = "Passed" if stdout == case['expected_output'] else "Failed"
+                if result["status"] == "Failed":
                     result["expected"] = case['expected_output']
             results.append(result)
-            
         except subprocess.TimeoutExpired:
-            results.append({"case": i + 1, "input": case['input'], "status": "Error", "output": "Execution timed out."})
+            results.append({
+                "case": i + 1, 
+                "input": case['input'], 
+                "status": "Error", 
+                "output": "Execution timed out.",
+                "type": case.get('type', 'extracted')
+            })
         except Exception as e:
-            results.append({"case": i + 1, "input": case['input'], "status": "Error", "output": f"An unexpected error occurred: {str(e)}"})
-            
+            results.append({
+                "case": i + 1, 
+                "input": case['input'], 
+                "status": "Error", 
+                "output": f"An unexpected error occurred: {str(e)}",
+                "type": case.get('type', 'extracted')
+            })
     return results
-
-def get_failed_test_summary(run_results):
-    """Creates a summary of failed tests for LLM feedback."""
-    failed_summary = []
-    for result in run_results:
-        if result['status'] in ['Failed', 'Error']:
-            summary = f"Test Case {result['case']}:\n"
-            summary += f"Input: {result['input']}\n"
-            summary += f"Your Output: {result['output']}\n"
-            if 'expected' in result:
-                summary += f"Expected Output: {result['expected']}\n"
-            summary += f"Status: {result['status']}\n"
-            failed_summary.append(summary)
-    return "\n---\n".join(failed_summary)
-
-def add_to_code_history(code, results, generation_num):
-    """Adds code attempt and results to history."""
-    history_item = {
-        "generation": generation_num,
-        "code": code,
-        "results": results,
-        "timestamp": time.strftime("%H:%M:%S")
-    }
-    st.session_state.code_history.append(history_item)
 
 # --- UI Layout ---
 
@@ -378,194 +346,241 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.markdown("### 🔑 Configuration")
-    api_key = st.text_input("Together AI API Key", type="password", value=st.session_state.api_key)
-    if api_key:
-        st.session_state.api_key = api_key
-        if 'api_key_configured' not in st.session_state:
-            st.success("API Key configured!")
-            st.session_state.api_key_configured = True
-    
-    # Code generation history in sidebar
-    if st.session_state.code_history:
-        st.markdown("### 📚 Generation History")
-        for i, item in enumerate(st.session_state.code_history):
-            passed_tests = sum(1 for r in item['results'] if r['status'] == 'Passed')
-            total_tests = len(item['results'])
-            with st.expander(f"Gen {item['generation']} ({passed_tests}/{total_tests}) - {item['timestamp']}"):
-                st.code(item['code'][:200] + "..." if len(item['code']) > 200 else item['code'], language="python")
+    st.markdown("### 🔑 API Configuration")
+    st.session_state.together_api_key = st.text_input("Together AI API Key", type="password", value=st.session_state.together_api_key, help="For text extraction and question formatting.")
+    st.session_state.gemini_api_key = st.text_input("Gemini API Key", type="password", value=st.session_state.gemini_api_key, help="For code generation.")
 
 # Main content tabs
-tab1, tab2, tab3, tab4 = st.tabs(["1. Upload Images", "2. Format Question", "3. Generate Code", "4. Run & Edit Code"])
+tabs = ["1. Upload Images", "2. Format Question", "3. Generate Code", "4. Run & Edit Code"]
+tab1, tab2, tab3, tab4 = st.tabs(tabs)
 
 with tab1:
     st.markdown('<div class="step-header">Step 1: Upload Question Images</div>', unsafe_allow_html=True)
-    uploaded_files = st.file_uploader("Choose up to 4 images of the DSA question", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
-    
+    uploaded_files = st.file_uploader("Choose up to 4 images", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
     if uploaded_files:
         st.session_state.uploaded_images = [Image.open(file) for file in uploaded_files]
-        st.markdown(f'<div class="success-message">✅ {len(st.session_state.uploaded_images)} image(s) uploaded!</div>', unsafe_allow_html=True)
+        st.success(f"{len(st.session_state.uploaded_images)} image(s) uploaded!")
         cols = st.columns(len(st.session_state.uploaded_images))
         for i, img in enumerate(st.session_state.uploaded_images):
-            cols[i].image(img, caption=f"Image {i+1}", use_container_width=True)
-
-    if st.session_state.uploaded_images and st.button("🔍 Extract Text from Images", type="primary", use_container_width=True):
-        raw_text = extract_text_from_images(st.session_state.uploaded_images, st.session_state.api_key)
-        if raw_text:
-            st.session_state.extracted_text = raw_text
-            st.success("Text extracted! Please proceed to the next tab to format the question.")
+            cols[i].image(img, caption=f"Image {i+1}", use_column_width=True)
+    if st.session_state.uploaded_images and st.button("🔍 Extract Text", type="primary", use_container_width=True):
+        st.session_state.extracted_text = extract_text_from_images(st.session_state.uploaded_images, st.session_state.together_api_key)
+        if st.session_state.extracted_text:
+            st.success("Text extracted! Proceed to the next tab.")
 
 with tab2:
-    st.markdown('<div class="step-header">Step 2: Format Question with AI</div>', unsafe_allow_html=True)
+    st.markdown('<div class="step-header">Step 2: Format and Edit Question</div>', unsafe_allow_html=True)
     if not st.session_state.extracted_text:
-        st.info("Please upload images and extract text in Step 1.")
+        st.info("Please upload and extract text in Step 1.")
     else:
-        with st.expander("📄 View Raw Extracted Text", expanded=False):
+        with st.expander("📄 View Raw Extracted Text"):
             st.text_area("", st.session_state.extracted_text, height=200, disabled=True)
-
-        if st.button("🤖 Format Question with Llama 3.3", type="primary", use_container_width=True):
-            with st.spinner("Formatting question... This may take a moment."):
-                formatted = format_question_with_llama(st.session_state.extracted_text, st.session_state.api_key)
-                if formatted:
-                    st.session_state.formatted_question = formatted
-                    st.session_state.test_cases = extract_test_cases(formatted)
-                    st.success("Question formatted successfully! Proceed to the next step.")
-
+        
+        if st.button("🤖 Format Question with AI", type="primary", use_container_width=True):
+            with st.spinner("Formatting question..."):
+                st.session_state.formatted_question = format_question_with_llama(st.session_state.extracted_text, st.session_state.together_api_key)
+                st.session_state.edited_question = st.session_state.formatted_question
+                st.session_state.test_cases = extract_test_cases(st.session_state.formatted_question)
+        
         if st.session_state.formatted_question:
             st.markdown("### ✨ AI-Formatted Question")
-            st.markdown(st.session_state.formatted_question, unsafe_allow_html=True)
+            with st.expander("📖 View AI-Formatted Question", expanded=True):
+                st.markdown(st.session_state.formatted_question)
+            
+            st.markdown("### ✏️ Edit Question")
+            st.session_state.edited_question = st.text_area(
+                "Edit the formatted question here:",
+                value=st.session_state.edited_question,
+                height=400,
+                help="You can modify the AI-formatted question before proceeding to code generation."
+            )
+            
+            if st.button("🔄 Update Test Cases from Edited Question", use_container_width=True):
+                st.session_state.test_cases = extract_test_cases(st.session_state.edited_question)
+                st.success(f"Updated! Extracted {len(st.session_state.test_cases)} test case(s) from edited question.")
+            
             if st.session_state.test_cases:
-                st.success(f"Successfully extracted {len(st.session_state.test_cases)} test case(s).")
-            else:
-                st.warning("Could not automatically extract test cases. Please check the formatted question.")
+                st.markdown("### 📋 Extracted Test Cases")
+                for i, case in enumerate(st.session_state.test_cases):
+                    with st.container():
+                        st.markdown(f"**Test Case {i+1}:**")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.text_area(f"Input {i+1}", value=case['input'], height=100, disabled=True, key=f"extracted_input_{i}")
+                        with col2:
+                            st.text_area(f"Expected Output {i+1}", value=case['expected_output'], height=100, disabled=True, key=f"extracted_output_{i}")
 
 with tab3:
-    st.markdown('<div class="step-header">Step 3: Generate Code Solution</div>', unsafe_allow_html=True)
-    if not st.session_state.formatted_question:
-        st.info("Please format the question in Step 2 first.")
+    st.markdown('<div class="step-header">Step 3: Generate Code with Gemini</div>', unsafe_allow_html=True)
+    if not st.session_state.edited_question:
+        st.info("Please format and edit the question in Step 2.")
     else:
-        st.markdown("#### Using this question:")
-        st.markdown(f'<div class="question-container">{st.session_state.formatted_question[:300]}...</div>', unsafe_allow_html=True)
+        with st.expander("📋 Question to be used for code generation"):
+            st.markdown(st.session_state.edited_question)
         
-        # Generate initial solution button
-        if st.session_state.generation_count == 0:
-            button_text = "🚀 Generate Initial Solution"
-        else:
-            button_text = f"🔄 Generate Solution (Attempt #{st.session_state.generation_count + 1})"
-            
-        if st.button(button_text, type="primary", use_container_width=True):
-            with st.spinner("Generating solution..."):
-                # Prepare context for regeneration
-                previous_attempts = None
-                error_feedback = None
-                
-                if st.session_state.generation_count > 0 and st.session_state.code_history:
-                    # Get previous attempts
-                    previous_attempts = "\n\n".join([f"Attempt {item['generation']}:\n{item['code']}" for item in st.session_state.code_history])
-                    
-                    # Get error feedback from last attempt
-                    if st.session_state.run_output:
-                        error_feedback = get_failed_test_summary(st.session_state.run_output)
-                
-                solution = generate_solution(
-                    st.session_state.formatted_question, 
-                    st.session_state.api_key,
-                    previous_attempts=previous_attempts,
-                    error_feedback=error_feedback,
-                    user_comments=st.session_state.user_feedback
-                )
-                
+        if st.button("🚀 Generate Solution with Gemini", type="primary", use_container_width=True):
+            with st.spinner("Generating solution with Gemini..."):
+                solution = generate_solution_with_gemini(st.session_state.edited_question, st.session_state.gemini_api_key)
                 if solution:
-                    st.session_state.generation_count += 1
                     st.session_state.generated_code = solution
-                    st.session_state.edited_code = solution # Initialize editor with generated code
-                    st.session_state.user_feedback = ""  # Clear previous feedback
-                    st.success(f"Solution generated (Attempt #{st.session_state.generation_count})! You can now run or edit it in the next tab.")
+                    st.session_state.edited_code = solution
+                    st.success("Solution generated! Proceed to the next tab to run it.")
         
         if st.session_state.generated_code:
-            st.markdown(f"### 💡 Generated Code (Attempt #{st.session_state.generation_count})")
+            st.markdown("### 💡 Generated Code")
             st.code(st.session_state.generated_code, language="python")
 
 with tab4:
-    st.markdown('<div class="step-header">Step 4: Run & Edit Code</div>', unsafe_allow_html=True)
+    st.markdown('<div class="step-header">Step 4: Test Cases, Run & Debug</div>', unsafe_allow_html=True)
     if not st.session_state.generated_code:
-        st.info("Please generate a code solution in Step 3 first.")
+        st.info("Please generate a solution in Step 3.")
     else:
-        st.markdown("### 🛠️ Code Editor")
-        edited_code = st.text_area(
-            "Edit your code here:",
-            value=st.session_state.edited_code,
-            height=400,
-            key="code_editor",
-            label_visibility="collapsed"
-        )
-        st.session_state.edited_code = edited_code
-
-        if not st.session_state.test_cases:
-            st.warning("No test cases were extracted. Cannot run the code.")
-        else:
-            if st.button("▶️ Run Code on Test Cases", type="primary", use_container_width=True):
-                with st.spinner("Running code..."):
-                    run_results = run_code(st.session_state.edited_code, st.session_state.test_cases)
-                    st.session_state.run_output = run_results
-                    
-                    # Add to history
-                    add_to_code_history(st.session_state.edited_code, run_results, st.session_state.generation_count)
-
-        if st.session_state.run_output:
-            st.markdown("### 📊 Execution Results")
-            
-            # Summary stats
-            passed_tests = sum(1 for r in st.session_state.run_output if r['status'] == 'Passed')
-            total_tests = len(st.session_state.run_output)
-            
-            if passed_tests == total_tests:
-                st.success(f"🎉 All {total_tests} test cases passed! Great job!")
-            else:
-                st.error(f"❌ {passed_tests}/{total_tests} test cases passed")
-                
-                # Show regeneration section for failed tests
-                st.markdown('<div class="regeneration-section">', unsafe_allow_html=True)
-                st.markdown("### 🔄 Code Regeneration")
-                st.markdown("Since some test cases failed, you can provide feedback to improve the solution:")
-                
-                user_feedback = st.text_area(
-                    "Add your comments about what might be wrong or what approach to try:",
-                    value=st.session_state.user_feedback,
-                    height=100,
-                    placeholder="e.g., 'The algorithm should handle negative numbers', 'Try using a different sorting approach', 'The output format seems incorrect'..."
-                )
-                st.session_state.user_feedback = user_feedback
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("🔄 Regenerate Code with Feedback", type="secondary", use_container_width=True):
-                        # Switch to tab 3 for regeneration
-                        st.info("Click on the 'Generate Code' tab and then click the generate button to create an improved solution based on the test failures and your feedback.")
-                
-                with col2:
-                    if st.button("📋 Copy Failed Test Info", use_container_width=True):
-                        failed_info = get_failed_test_summary(st.session_state.run_output)
-                        st.code(failed_info, language="text")
-                        
-                st.markdown('</div>', unsafe_allow_html=True)
-            
-            # Detailed test results
-            for result in st.session_state.run_output:
-                status_color = "green" if result['status'] == 'Passed' else "red"
+        # Test Cases Management Section
+        st.markdown("### 📋 Test Cases Management")
+        
+        # Display extracted test cases
+        if st.session_state.test_cases:
+            st.markdown("#### Extracted Test Cases")
+            for i, case in enumerate(st.session_state.test_cases):
                 with st.container():
-                    st.markdown(f"**Test Case {result['case']}**: <span class='test-case-{result['status'].lower()}'>{result['status']}</span>", unsafe_allow_html=True)
-                    col1, col2, col3 = st.columns(3)
-                    col1.text_area("Input", value=result['input'], height=100, disabled=True, key=f"input_{result['case']}_{st.session_state.generation_count}")
-                    col2.text_area("Your Output", value=result['output'], height=100, disabled=True, key=f"output_{result['case']}_{st.session_state.generation_count}")
+                    st.markdown(f'<div class="test-case-container">', unsafe_allow_html=True)
+                    st.markdown(f"**Extracted Test Case {i+1}:**")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.text_area(f"Input", value=case['input'], height=80, disabled=True, key=f"ext_display_input_{i}")
+                    with col2:
+                        st.text_area(f"Expected Output", value=case['expected_output'], height=80, disabled=True, key=f"ext_display_output_{i}")
+                    st.markdown('</div>', unsafe_allow_html=True)
+        
+        # Custom test cases section
+        st.markdown("#### Custom Test Cases")
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            if st.button("➕ Add Custom Test Case"):
+                add_custom_test_case()
+        
+        # Display and edit custom test cases
+        if st.session_state.custom_test_cases:
+            for i, case in enumerate(st.session_state.custom_test_cases):
+                with st.container():
+                    st.markdown(f'<div class="test-case-container">', unsafe_allow_html=True)
+                    col1, col2, col3 = st.columns([3, 3, 1])
+                    with col1:
+                        st.session_state.custom_test_cases[i]['input'] = st.text_area(
+                            f"Custom Input {i+1}", 
+                            value=case['input'], 
+                            height=80, 
+                            key=f"custom_input_{i}"
+                        )
+                    with col2:
+                        st.session_state.custom_test_cases[i]['expected_output'] = st.text_area(
+                            f"Custom Expected Output {i+1}", 
+                            value=case['expected_output'], 
+                            height=80, 
+                            key=f"custom_output_{i}"
+                        )
+                    with col3:
+                        st.write("")  # Add some spacing
+                        st.write("")  # Add some spacing
+                        if st.button("🗑️", key=f"remove_custom_{i}", help="Remove this test case"):
+                            remove_custom_test_case(i)
+                            st.rerun()
+                    st.markdown('</div>', unsafe_allow_html=True)
+        
+        # Code Editor Section
+        st.markdown("### 🛠️ Code Editor")
+        st.session_state.edited_code = st.text_area("Edit your code here:", value=st.session_state.edited_code, height=400, label_visibility="collapsed")
+
+        # Get all test cases for execution
+        all_test_cases = get_all_test_cases()
+        
+        if all_test_cases and st.button("▶️ Run Code on All Test Cases", type="primary", use_container_width=True):
+            st.session_state.run_output = run_code(st.session_state.edited_code, all_test_cases)
+            st.session_state.error_feedback = ""  # Clear old feedback on new run
+
+        # Enhanced Debugger UI
+        if st.session_state.run_output:
+            failed_cases = [r for r in st.session_state.run_output if r['status'] in ['Error', 'Failed']]
+            
+            if failed_cases:
+                with st.container():
+                    st.markdown('<div class="debugger-container">', unsafe_allow_html=True)
+                    st.error(f"Issues detected in {len(failed_cases)} test case(s).")
+                    
+                    # Group failed cases by type
+                    error_cases = [r for r in failed_cases if r['status'] == 'Error']
+                    failed_test_cases = [r for r in failed_cases if r['status'] == 'Failed']
+                    
+                    if error_cases:
+                        st.markdown("**Runtime Errors:**")
+                        for error in error_cases:
+                            st.markdown(f"- **Test Case {error['case']} ({error.get('type', 'extracted').title()})**: {error['output']}")
+                    
+                    if failed_test_cases:
+                        st.markdown("**Wrong Output:**")
+                        for fail in failed_test_cases:
+                            st.markdown(f"- **Test Case {fail['case']} ({fail.get('type', 'extracted').title()})**: Expected `{fail['expected']}`, got `{fail['output']}`")
+                    
+                    st.session_state.error_feedback = st.text_area(
+                        "Add comments or hints for Gemini to fix the code:", 
+                        value=st.session_state.error_feedback,
+                        height=100,
+                        placeholder="e.g., 'The algorithm should handle edge cases like empty arrays' or 'Consider using a different data structure'"
+                    )
+
+                    if st.button("🔧 Fix Code with Gemini", use_container_width=True):
+                        with st.spinner("Gemini is analyzing and fixing the code..."):
+                            # Create detailed error context for Gemini
+                            error_details = []
+                            for result in failed_cases:
+                                if result['status'] == 'Error':
+                                    error_details.append(f"Test Case {result['case']} ({result.get('type', 'extracted').title()}) - Runtime Error: {result['output']}")
+                                elif result['status'] == 'Failed':
+                                    error_details.append(f"Test Case {result['case']} ({result.get('type', 'extracted').title()}) - Wrong Output: Expected '{result['expected']}', Got '{result['output']}'")
+                            
+                            error_context = "\n".join(error_details)
+                            
+                            new_code = generate_solution_with_gemini(
+                                st.session_state.edited_question, 
+                                st.session_state.gemini_api_key,
+                                previous_code=st.session_state.edited_code,
+                                error_message=error_context,
+                                user_feedback=st.session_state.error_feedback
+                            )
+                            if new_code:
+                                st.session_state.edited_code = new_code
+                                st.session_state.generated_code = new_code
+                                st.session_state.run_output = []  # Clear old results
+                                st.success("Gemini generated a new solution! It's now in the editor above.")
+                                st.rerun()
+                    st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.success("🎉 All test cases passed!")
+
+        # Display detailed results
+        if st.session_state.run_output:
+            st.markdown("### 📊 Detailed Execution Results")
+            for result in st.session_state.run_output:
+                with st.container():
+                    case_type_badge = f"({result.get('type', 'extracted').title()})"
+                    st.markdown(f"**Test Case {result['case']} {case_type_badge}**: <span class='test-case-{result['status'].lower()}'>{result['status']}</span>", unsafe_allow_html=True)
+                    
                     if result['status'] == 'Failed':
-                        col3.text_area("Expected Output", value=result.get('expected', ''), height=100, disabled=True, key=f"expected_{result['case']}_{st.session_state.generation_count}")
+                        cols = st.columns(3)
+                        cols[0].text_area("Input", value=result['input'], height=100, disabled=True, key=f"result_input_{result['case']}")
+                        cols[1].text_area("Your Output", value=result['output'], height=100, disabled=True, key=f"result_output_{result['case']}")
+                        cols[2].text_area("Expected", value=result.get('expected', ''), height=100, disabled=True, key=f"result_expected_{result['case']}")
+                    else:
+                        cols = st.columns(2)
+                        cols[0].text_area("Input", value=result['input'], height=100, disabled=True, key=f"result_input_2col_{result['case']}")
+                        cols[1].text_area("Output", value=result['output'], height=100, disabled=True, key=f"result_output_2col_{result['case']}")
+                    
                     st.markdown("---")
 
 # Footer
 st.markdown("""
 ---
 <div style="text-align: center; color: #6c757d; padding: 1rem;">
-    <p>Built with ❤️ using Streamlit and Together AI</p>
+    <p>Built with ❤️ using Streamlit, Together AI, and Gemini</p>
 </div>
 """, unsafe_allow_html=True)
